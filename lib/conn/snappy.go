@@ -1,23 +1,20 @@
 package conn
 
 import (
-	"github.com/cnlh/nps/lib/pool"
-	"github.com/cnlh/nps/lib/rate"
-	"github.com/cnlh/nps/vender/github.com/golang/snappy"
-	"net"
+	"io"
+
+	"github.com/golang/snappy"
 )
 
 type SnappyConn struct {
-	w    *snappy.Writer
-	r    *snappy.Reader
-	rate *rate.Rate
+	w *snappy.Writer
+	r *snappy.Reader
 }
 
-func NewSnappyConn(conn net.Conn, crypt bool, rate *rate.Rate) *SnappyConn {
+func NewSnappyConn(conn io.ReadWriteCloser) *SnappyConn {
 	c := new(SnappyConn)
 	c.w = snappy.NewBufferedWriter(conn)
 	c.r = snappy.NewReader(conn)
-	c.rate = rate
 	return c
 }
 
@@ -29,22 +26,15 @@ func (s *SnappyConn) Write(b []byte) (n int, err error) {
 	if err = s.w.Flush(); err != nil {
 		return
 	}
-	if s.rate != nil {
-		s.rate.Get(int64(n))
-	}
 	return
 }
 
 //snappy压缩读
 func (s *SnappyConn) Read(b []byte) (n int, err error) {
-	buf := pool.BufPool.Get().([]byte)
-	defer pool.BufPool.Put(buf)
-	if n, err = s.r.Read(buf); err != nil {
-		return
-	}
-	copy(b, buf[:n])
-	if s.rate != nil {
-		s.rate.Get(int64(n))
-	}
-	return
+	return s.r.Read(b)
+}
+
+func (s *SnappyConn) Close() error {
+	s.w.Close()
+	return s.w.Close()
 }

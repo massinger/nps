@@ -2,14 +2,15 @@ package proxy
 
 import (
 	"errors"
-	"github.com/cnlh/nps/bridge"
-	"github.com/cnlh/nps/lib/common"
-	"github.com/cnlh/nps/lib/conn"
-	"github.com/cnlh/nps/lib/file"
-	"github.com/cnlh/nps/lib/pool"
 	"net"
 	"net/http"
 	"sync"
+
+	"ehang.io/nps/bridge"
+	"ehang.io/nps/lib/common"
+	"ehang.io/nps/lib/conn"
+	"ehang.io/nps/lib/file"
+	"github.com/astaxie/beego/logs"
 )
 
 type Service interface {
@@ -17,67 +18,52 @@ type Service interface {
 	Close() error
 }
 
-//server base struct
-type server struct {
+type NetBridge interface {
+	SendLinkInfo(clientId int, link *conn.Link, t *file.Tunnel) (target net.Conn, err error)
+}
+
+//BaseServer struct
+type BaseServer struct {
 	id           int
-	bridge       *bridge.Bridge
+	bridge       NetBridge
 	task         *file.Tunnel
 	errorContent []byte
 	sync.Mutex
 }
 
-func (s *server) FlowAdd(in, out int64) {
+func NewBaseServer(bridge *bridge.Bridge, task *file.Tunnel) *BaseServer {
+	return &BaseServer{
+		bridge:       bridge,
+		task:         task,
+		errorContent: nil,
+		Mutex:        sync.Mutex{},
+	}
+}
+
+//add the flow
+func (s *BaseServer) FlowAdd(in, out int64) {
 	s.Lock()
 	defer s.Unlock()
 	s.task.Flow.ExportFlow += out
 	s.task.Flow.InletFlow += in
 }
 
-func (s *server) FlowAddHost(host *file.Host, in, out int64) {
+//change the flow
+func (s *BaseServer) FlowAddHost(host *file.Host, in, out int64) {
 	s.Lock()
 	defer s.Unlock()
 	host.Flow.ExportFlow += out
 	host.Flow.InletFlow += in
 }
 
-func (s *server) linkCopy(link *conn.Link, c *conn.Conn, rb []byte, tunnel *conn.Conn, flow *file.Flow) {
-	if rb != nil {
-		if _, err := tunnel.SendMsg(rb, link); err != nil {
-			c.Close()
-			return
-		}
-		flow.Add(len(rb), 0)
-		<-link.StatusCh
-	}
-
-	buf := pool.BufPoolCopy.Get().([]byte)
-	for {
-		if err := s.checkFlow(); err != nil {
-			c.Close()
-			break
-		}
-		if n, err := c.Read(buf); err != nil {
-			tunnel.SendMsg([]byte(common.IO_EOF), link)
-			break
-		} else {
-			if _, err := tunnel.SendMsg(buf[:n], link); err != nil {
-				c.Close()
-				break
-			}
-			flow.Add(n, 0)
-		}
-		<-link.StatusCh
-	}
-	pool.PutBufPoolCopy(buf)
-}
-
-func (s *server) writeConnFail(c net.Conn) {
+//write fail bytes to the connection
+func (s *BaseServer) writeConnFail(c net.Conn) {
 	c.Write([]byte(common.ConnectionFailBytes))
 	c.Write(s.errorContent)
 }
 
-//权限认证
-func (s *server) auth(r *http.Request, c *conn.Conn, u, p string) error {
+//auth check
+func (s *BaseServer) auth(r *http.Request, c *conn.Conn, u, p string) error {
 	if u != "" && p != "" && !common.CheckAuth(r, u, p) {
 		c.Write([]byte(common.UnauthorizedBytes))
 		c.Close()
@@ -86,9 +72,29 @@ func (s *server) auth(r *http.Request, c *conn.Conn, u, p string) error {
 	return nil
 }
 
-func (s *server) checkFlow() error {
-	if s.task.Client.Flow.FlowLimit > 0 && (s.task.Client.Flow.FlowLimit<<20) < (s.task.Client.Flow.ExportFlow+s.task.Client.Flow.InletFlow) {
+//check flow limit of the client ,and decrease the allow num of client
+func (s *BaseServer) CheckFlowAndConnNum(client *file.Client) error {
+	if client.Flow.FlowLimit > 0 && (client.Flow.FlowLimit<<20) < (client.Flow.ExportFlow+client.Flow.InletFlow) {
 		return errors.New("Traffic exceeded")
+	}
+	if !client.GetConn() {
+		return errors.New("Connections exceed the current client limit")
+	}
+	return nil
+}
+
+//create a new connection and start bytes copying
+func (s *BaseServer) DealClient(c *conn.Conn, client *file.Client, addr string, rb []byte, tp string, f func(), flow *file.Flow, localProxy bool) error {
+	link := conn.NewLink(tp, addr, client.Cnf.Crypt, client.Cnf.Compress, c.Conn.RemoteAddr().String(), localProxy)
+	if target, err := s.bridge.SendLinkInfo(client.Id, link, s.task); err != nil {
+		logs.Warn("get connection from client id %d  error %s", client.Id, err.Error())
+		c.Close()
+		return err
+	} else {
+		if f != nil {
+			f()
+		}
+		conn.CopyWaitGroup(target, c.Conn, link.Crypt, link.Compress, client.Rate, flow, true, rb)
 	}
 	return nil
 }

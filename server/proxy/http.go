@@ -3,94 +3,101 @@ package proxy
 import (
 	"bufio"
 	"crypto/tls"
-	"github.com/cnlh/nps/bridge"
-	"github.com/cnlh/nps/lib/common"
-	"github.com/cnlh/nps/lib/conn"
-	"github.com/cnlh/nps/lib/file"
-	"github.com/cnlh/nps/lib/lg"
-	"github.com/cnlh/nps/vender/github.com/astaxie/beego"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+
+	"ehang.io/nps/bridge"
+	"ehang.io/nps/lib/cache"
+	"ehang.io/nps/lib/common"
+	"ehang.io/nps/lib/conn"
+	"ehang.io/nps/lib/file"
+	"ehang.io/nps/server/connection"
+	"github.com/astaxie/beego/logs"
 )
 
 type httpServer struct {
-	server
-	httpPort  int //http端口
-	httpsPort int //https监听端口
-	pemPath   string
-	keyPath   string
-	stop      chan bool
+	BaseServer
+	httpPort      int
+	httpsPort     int
+	httpServer    *http.Server
+	httpsServer   *http.Server
+	httpsListener net.Listener
+	useCache      bool
+	addOrigin     bool
+	cache         *cache.Cache
+	cacheLen      int
 }
 
-func NewHttp(bridge *bridge.Bridge, c *file.Tunnel) *httpServer {
-	httpPort, _ := beego.AppConfig.Int("httpProxyPort")
-	httpsPort, _ := beego.AppConfig.Int("httpsProxyPort")
-	pemPath := beego.AppConfig.String("pemPath")
-	keyPath := beego.AppConfig.String("keyPath")
-	return &httpServer{
-		server: server{
+func NewHttp(bridge *bridge.Bridge, c *file.Tunnel, httpPort, httpsPort int, useCache bool, cacheLen int, addOrigin bool) *httpServer {
+	httpServer := &httpServer{
+		BaseServer: BaseServer{
 			task:   c,
 			bridge: bridge,
 			Mutex:  sync.Mutex{},
 		},
 		httpPort:  httpPort,
 		httpsPort: httpsPort,
-		pemPath:   pemPath,
-		keyPath:   keyPath,
-		stop:      make(chan bool),
+		useCache:  useCache,
+		cacheLen:  cacheLen,
+		addOrigin: addOrigin,
 	}
+	if useCache {
+		httpServer.cache = cache.New(cacheLen)
+	}
+	return httpServer
 }
 
 func (s *httpServer) Start() error {
 	var err error
-	var http, https *http.Server
 	if s.errorContent, err = common.ReadAllFromFile(filepath.Join(common.GetRunPath(), "web", "static", "page", "error.html")); err != nil {
-		s.errorContent = []byte("easyProxy 404")
+		s.errorContent = []byte("nps 404")
 	}
-
 	if s.httpPort > 0 {
-		http = s.NewServer(s.httpPort)
+		s.httpServer = s.NewServer(s.httpPort, "http")
 		go func() {
-			lg.Println("Start http listener, port is", s.httpPort)
-			err := http.ListenAndServe()
+			l, err := connection.GetHttpListener()
 			if err != nil {
-				lg.Fatalln(err)
+				logs.Error(err)
+				os.Exit(0)
+			}
+			err = s.httpServer.Serve(l)
+			if err != nil {
+				logs.Error(err)
+				os.Exit(0)
 			}
 		}()
 	}
 	if s.httpsPort > 0 {
-		if !common.FileExists(s.pemPath) {
-			lg.Fatalf("ssl certFile %s is not exist", s.pemPath)
-		}
-		if !common.FileExists(s.keyPath) {
-			lg.Fatalf("ssl keyFile %s exist", s.keyPath)
-		}
-		https = s.NewServer(s.httpsPort)
+		s.httpsServer = s.NewServer(s.httpsPort, "https")
 		go func() {
-			lg.Println("Start https listener, port is", s.httpsPort)
-			err := https.ListenAndServeTLS(s.pemPath, s.keyPath)
+			s.httpsListener, err = connection.GetHttpsListener()
 			if err != nil {
-				lg.Fatalln(err)
+				logs.Error(err)
+				os.Exit(0)
 			}
+			logs.Error(NewHttpsServer(s.httpsListener, s.bridge, s.useCache, s.cacheLen).Start())
 		}()
-	}
-	select {
-	case <-s.stop:
-		if http != nil {
-			http.Close()
-		}
-		if https != nil {
-			https.Close()
-		}
 	}
 	return nil
 }
 
 func (s *httpServer) Close() error {
-	s.stop <- true
+	if s.httpsListener != nil {
+		s.httpsListener.Close()
+	}
+	if s.httpsServer != nil {
+		s.httpsServer.Close()
+	}
+	if s.httpServer != nil {
+		s.httpServer.Close()
+	}
 	return nil
 }
 
@@ -104,84 +111,161 @@ func (s *httpServer) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}
-	s.process(conn.NewConn(c), r)
+	s.handleHttp(conn.NewConn(c), r)
 }
 
-func (s *httpServer) process(c *conn.Conn, r *http.Request) {
-	//多客户端域名代理
+func (s *httpServer) handleHttp(c *conn.Conn, r *http.Request) {
 	var (
-		isConn   = true
-		lk       *conn.Link
-		host     *file.Host
-		tunnel   *conn.Conn
-		lastHost *file.Host
-		err      error
+		host       *file.Host
+		target     net.Conn
+		err        error
+		connClient io.ReadWriteCloser
+		scheme     = r.URL.Scheme
+		lk         *conn.Link
+		targetAddr string
+		lenConn    *conn.LenConn
+		isReset    bool
+		wg         sync.WaitGroup
 	)
-	if host, err = file.GetCsvDb().GetInfoByHost(r.Host, r); err != nil {
-		lg.Printf("the url %s %s can't be parsed!", r.Host, r.RequestURI)
-		goto end
-	} else {
-		lastHost = host
-	}
-	for {
-	start:
-		if isConn {
-			//流量限制
-			if host.Client.Flow.FlowLimit > 0 && (host.Client.Flow.FlowLimit<<20) < (host.Client.Flow.ExportFlow+host.Client.Flow.InletFlow) {
-				break
-			}
-			host.Client.Cnf.CompressDecode, host.Client.Cnf.CompressEncode = common.GetCompressType(host.Client.Cnf.Compress)
-			//权限控制
-			if err = s.auth(r, c, host.Client.Cnf.U, host.Client.Cnf.P); err != nil {
-				break
-			}
-			lk = conn.NewLink(host.Client.GetId(), common.CONN_TCP, host.GetRandomTarget(), host.Client.Cnf.CompressEncode, host.Client.Cnf.CompressDecode, host.Client.Cnf.Crypt, c, host.Flow, nil, host.Client.Rate, nil)
-			if tunnel, err = s.bridge.SendLinkInfo(host.Client.Id, lk, c.Conn.RemoteAddr().String()); err != nil {
-				lg.Println(err)
-				break
-			}
-			lk.Run(true)
-			isConn = false
+	defer func() {
+		if connClient != nil {
+			connClient.Close()
 		} else {
-			r, err = http.ReadRequest(bufio.NewReader(c))
-			if err != nil {
-				break
+			s.writeConnFail(c.Conn)
+		}
+		c.Close()
+	}()
+reset:
+	if isReset {
+		host.Client.AddConn()
+	}
+	if host, err = file.GetDb().GetInfoByHost(r.Host, r); err != nil {
+		logs.Notice("the url %s %s %s can't be parsed!", r.URL.Scheme, r.Host, r.RequestURI)
+		return
+	}
+	if err := s.CheckFlowAndConnNum(host.Client); err != nil {
+		logs.Warn("client id %d, host id %d, error %s, when https connection", host.Client.Id, host.Id, err.Error())
+		return
+	}
+	if !isReset {
+		defer host.Client.AddConn()
+	}
+	if err = s.auth(r, c, host.Client.Cnf.U, host.Client.Cnf.P); err != nil {
+		logs.Warn("auth error", err, r.RemoteAddr)
+		return
+	}
+	if targetAddr, err = host.Target.GetRandomTarget(); err != nil {
+		logs.Warn(err.Error())
+		return
+	}
+	lk = conn.NewLink("http", targetAddr, host.Client.Cnf.Crypt, host.Client.Cnf.Compress, r.RemoteAddr, host.Target.LocalProxy)
+	if target, err = s.bridge.SendLinkInfo(host.Client.Id, lk, nil); err != nil {
+		logs.Notice("connect to target %s error %s", lk.Host, err)
+		return
+	}
+	connClient = conn.GetConn(target, lk.Crypt, lk.Compress, host.Client.Rate, true)
+
+	//read from inc-client
+	go func() {
+		wg.Add(1)
+		isReset = false
+		defer connClient.Close()
+		defer func() {
+			wg.Done()
+			if !isReset {
+				c.Close()
 			}
-			if host, err = file.GetCsvDb().GetInfoByHost(r.Host, r); err != nil {
-				lg.Printf("the url %s %s is not found !", r.Host, r.RequestURI)
-				break
-			} else if host != lastHost {
-				lastHost = host
-				isConn = true
-				goto start
+		}()
+		for {
+			if resp, err := http.ReadResponse(bufio.NewReader(connClient), r); err != nil || resp == nil {
+				return
+			} else {
+				//if the cache is start and the response is in the extension,store the response to the cache list
+				if s.useCache && r.URL != nil && strings.Contains(r.URL.Path, ".") {
+					b, err := httputil.DumpResponse(resp, true)
+					if err != nil {
+						return
+					}
+					c.Write(b)
+					host.Flow.Add(0, int64(len(b)))
+					s.cache.Add(filepath.Join(host.Host, r.URL.Path), b)
+				} else {
+					lenConn := conn.NewLenConn(c)
+					if err := resp.Write(lenConn); err != nil {
+						logs.Error(err)
+						return
+					}
+					host.Flow.Add(0, int64(lenConn.Len))
+				}
 			}
 		}
-		//根据设定，修改header和host
-		common.ChangeHostAndHeader(r, host.HostChange, host.HeaderChange, c.Conn.RemoteAddr().String())
-		b, err := httputil.DumpRequest(r, true)
-		if err != nil {
+	}()
+
+	for {
+		//if the cache start and the request is in the cache list, return the cache
+		if s.useCache {
+			if v, ok := s.cache.Get(filepath.Join(host.Host, r.URL.Path)); ok {
+				n, err := c.Write(v.([]byte))
+				if err != nil {
+					break
+				}
+				logs.Trace("%s request, method %s, host %s, url %s, remote address %s, return cache", r.URL.Scheme, r.Method, r.Host, r.URL.Path, c.RemoteAddr().String())
+				host.Flow.Add(0, int64(n))
+				//if return cache and does not create a new conn with client and Connection is not set or close, close the connection.
+				if strings.ToLower(r.Header.Get("Connection")) == "close" || strings.ToLower(r.Header.Get("Connection")) == "" {
+					break
+				}
+				goto readReq
+			}
+		}
+
+		//change the host and header and set proxy setting
+		common.ChangeHostAndHeader(r, host.HostChange, host.HeaderChange, c.Conn.RemoteAddr().String(), s.addOrigin)
+		logs.Trace("%s request, method %s, host %s, url %s, remote address %s, target %s", r.URL.Scheme, r.Method, r.Host, r.URL.Path, c.RemoteAddr().String(), lk.Host)
+		//write
+		lenConn = conn.NewLenConn(connClient)
+		if err := r.Write(lenConn); err != nil {
+			logs.Error(err)
 			break
 		}
-		host.Flow.Add(len(b), 0)
-		if _, err := tunnel.SendMsg(b, lk); err != nil {
-			c.Close()
+		host.Flow.Add(int64(lenConn.Len), 0)
+
+	readReq:
+		//read req from connection
+		if r, err = http.ReadRequest(bufio.NewReader(c)); err != nil {
 			break
 		}
-		<-lk.StatusCh
+		r.URL.Scheme = scheme
+		//What happened ，Why one character less???
+		r.Method = resetReqMethod(r.Method)
+		if hostTmp, err := file.GetDb().GetInfoByHost(r.Host, r); err != nil {
+			logs.Notice("the url %s %s %s can't be parsed!", r.URL.Scheme, r.Host, r.RequestURI)
+			break
+		} else if host != hostTmp {
+			host = hostTmp
+			isReset = true
+			connClient.Close()
+			goto reset
+		}
 	}
-end:
-	if isConn {
-		s.writeConnFail(c.Conn)
-	} else {
-		tunnel.SendMsg([]byte(common.IO_EOF), lk)
-	}
-	c.Close()
+	wg.Wait()
 }
 
-func (s *httpServer) NewServer(port int) *http.Server {
+func resetReqMethod(method string) string {
+	if method == "ET" {
+		return "GET"
+	}
+	if method == "OST" {
+		return "POST"
+	}
+	return method
+}
+
+func (s *httpServer) NewServer(port int, scheme string) *http.Server {
 	return &http.Server{
 		Addr: ":" + strconv.Itoa(port),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Scheme = scheme
 			s.handleTunneling(w, r)
 		}),
 		// Disable HTTP/2.
