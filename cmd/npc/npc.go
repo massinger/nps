@@ -233,13 +233,13 @@ func run() {
 		go func() {
 			for {
 				client.NewRPClient(*serverAddr, *verifyKey, *connType, *proxyUrl, nil, *disconnectTime).Start()
-				logs.Info("It will be reconnected in five seconds")
+				logs.Info("Client closed! It will be reconnected in five seconds")
 				time.Sleep(time.Second * 5)
 			}
 		}()
 	} else {
 		if *configPath == "" {
-			*configPath = "conf/npc.conf"
+			*configPath = common.GetConfigPath()
 		}
 		go client.StartFromFile(*configPath)
 	}
